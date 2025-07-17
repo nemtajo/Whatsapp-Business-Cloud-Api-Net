@@ -489,7 +489,17 @@ namespace WhatsAppBusinessCloudAPI.Web.Controllers
                 textTemplateMessage.Template.Language = new TextMessageLanguage();
                 textTemplateMessage.Template.Language.Code = "en_US";
 
-                var results = await _whatsAppBusinessClient.SendTextMessageTemplateAsync(textTemplateMessage);
+                var cloudApiConfig = new WhatsAppBusinessCloudApiConfig
+                {
+                    WhatsAppBusinessId = sendTemplateMessageViewModel.WhatsAppBusinessId,
+                    WhatsAppBusinessAccountId = sendTemplateMessageViewModel.WhatsAppBusinessAccountId,
+                    WhatsAppBusinessPhoneNumberId = sendTemplateMessageViewModel.WhatsAppBusinessPhoneNumberId,
+                    AccessToken = sendTemplateMessageViewModel.AccessToken,
+                    AppName = "TEST",
+                    Version = "v23.0"
+                };
+
+                var results = await _whatsAppBusinessClient.SendTextMessageTemplateAsync(textTemplateMessage, cloudApiConfig);
 
                 if (results != null)
                 {
