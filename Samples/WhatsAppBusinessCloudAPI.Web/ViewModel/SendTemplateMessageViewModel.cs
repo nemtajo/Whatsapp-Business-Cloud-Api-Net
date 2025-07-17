@@ -8,6 +8,10 @@
         public string? MediaId { get; set; }
         public string? LinkUrl { get; set; }
         public string? TemplateParams { get; set; }
+        public string WhatsAppBusinessPhoneNumberId { get; set; }
+        public string WhatsAppBusinessAccountId { get; set; }
+        public string WhatsAppBusinessId { get; set; }
+        public string AccessToken { get; set; }
 
     }
 }
