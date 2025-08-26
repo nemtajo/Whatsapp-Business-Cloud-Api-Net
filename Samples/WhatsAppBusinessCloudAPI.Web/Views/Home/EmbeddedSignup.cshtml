@@ -375,14 +375,14 @@
             if (response.authResponse) {
                 const code = response.authResponse.code;
                 updateStatus('Authorization code received from SDK, exchanging for access token...', 'info');
-                console.log('Using redirect URI for token exchange:', redirectUri);
+                console.log('Using redirect URI for token exchange: null');
                 
                 // Prepare the token exchange request
                 const tokenRequest = {
                     code: code,
                     clientId: appId,
                     clientSecret: appSecret,
-                    redirectUri: redirectUri
+                    redirectUri: null
                 };
                 
                 // Display the token exchange request
@@ -429,6 +429,8 @@
             // Generate state parameter for security
             const state = generateState();
             sessionStorage.setItem('oauth_state', state);
+
+            const extras = { "version": "v3" };
             
             // Construct manual OAuth authorization URL
             const authParams = new URLSearchParams({
@@ -437,7 +439,7 @@
                 state: state,
                 response_type: 'code',
                 config_id: embeddedSignupConfigurationId,
-                extras: JSON.stringify({ "version": "v3" })
+                extras: JSON.stringify(extras)
             });
             
             const authUrl = `https://www.facebook.com/${metaGraphApiVersion}/dialog/oauth?${authParams.toString()}`;
@@ -459,16 +461,23 @@
             }
             
             updateStatus('Starting WhatsApp signup flow using SDK...', 'info');
-            console.log('Using redirect URI for FB.login:', redirectUri);
+            console.log('SDK Flow: Using Facebook internal cross-domain communication (no redirect URI needed)');
+
+            const extras = {
+                "version": "v3",
+                sessionInfoVersion: 3 // Required to get WABA ID
+            };
+            
+            console.log('Extras used for SDK flow:', extras);
             
             try {
-                // Launch Facebook login
+                // Launch Facebook login - SDK handles redirect internally, no fallback_redirect_uri needed
                 FB.login(fbLoginCallback, {
                     config_id: embeddedSignupConfigurationId,
+                    auth_type: "rerequest", // Avoids 'user is already logged' in errors if users click the button again before refreshing the page
                     response_type: 'code',
                     override_default_response_type: true,
-                    fallback_redirect_uri: redirectUri,
-                    extras: { "version": "v3" }
+                    extras: extras
                 });
             } catch (error) {
                 console.error('FB.login error:', error);

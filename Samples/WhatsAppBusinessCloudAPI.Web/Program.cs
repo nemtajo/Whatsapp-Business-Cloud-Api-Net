@@ -3,6 +3,7 @@ using WhatsappBusiness.CloudApi.Configurations;
 using WhatsappBusiness.CloudApi.Extensions;
 using WhatsAppBusinessCloudAPI.Web.Hubs;
 using WhatsAppBusinessCloudAPI.Web.Models;
+using WhatsAppBusinessCloudAPI.Web.TwilioIntegration;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -36,6 +37,14 @@ whatsAppConfig.Version = builder.Configuration.GetSection("WhatsAppBusinessCloud
 whatsAppConfig.WebhookVerifyToken = builder.Configuration.GetSection("WhatsAppBusinessCloudApiConfiguration")["WebhookVerifyToken"];
 
 builder.Services.AddWhatsAppBusinessCloudApiService(whatsAppConfig);
+
+builder.Services.AddTwilioClient();
+
+EmbeddedSignupConfiguration embeddedSignupConfig = new EmbeddedSignupConfiguration();
+builder.Configuration.GetSection("EmbeddedSignupConfiguration").Bind(embeddedSignupConfig);
+builder.Services.AddSingleton(embeddedSignupConfig);
+
+builder.Services.AddScoped<ITwilioIntegrationService, TwilioIntegrationService>();
 
 var app = builder.Build();
 

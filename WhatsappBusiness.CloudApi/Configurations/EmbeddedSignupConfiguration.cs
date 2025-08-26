@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace WhatsappBusiness.CloudApi.Configurations
 {
     public class EmbeddedSignupConfiguration
@@ -7,5 +9,6 @@ namespace WhatsappBusiness.CloudApi.Configurations
         public string ConfigurationId { get; set; }
         public string GraphApiVersion { get; set; }
         public string BaseUrl { get; set; }
+        public string PartnerSolutionId { get; set; }
     }
 }
