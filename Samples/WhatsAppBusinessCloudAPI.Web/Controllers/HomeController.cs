@@ -2,6 +2,13 @@
 using Microsoft.AspNetCore.Mvc.Rendering;
 using Microsoft.Extensions.Options;
 using System.Diagnostics;
+using Twilio.Rest.Api.V2010;
+using Twilio.Rest.Api.V2010.Account;
+using Twilio.Rest.Api.V2010.Account.AvailablePhoneNumberCountry;
+using Twilio.Rest.Messaging.V2;
+using Twilio.Clients;
+using Twilio.Types;
+using TwilioExceptions = Twilio.Exceptions;
 using WhatsappBusiness.CloudApi;
 using WhatsappBusiness.CloudApi.AccountMetrics;
 using WhatsappBusiness.CloudApi.Configurations;
@@ -13,6 +20,7 @@ using WhatsappBusiness.CloudApi.Response;
 using WhatsAppBusinessCloudAPI.Web.Extensions.Alerts;
 using WhatsAppBusinessCloudAPI.Web.Models;
 using WhatsAppBusinessCloudAPI.Web.ViewModel;
+using WhatsAppBusinessCloudAPI.Web.TwilioIntegration;
 
 namespace WhatsAppBusinessCloudAPI.Web.Controllers
 {
@@ -23,15 +31,20 @@ namespace WhatsAppBusinessCloudAPI.Web.Controllers
         private readonly WhatsAppBusinessCloudApiConfig _whatsAppConfig;
         private readonly EmbeddedSignupConfiguration _embeddedSignupConfig;
         private readonly IWebHostEnvironment _environment;
+        private readonly ITwilioRestClient _twilioClient;
+        private readonly ITwilioIntegrationService _twilioIntegrationService;
 
         public HomeController(ILogger<HomeController> logger, IWhatsAppBusinessClient whatsAppBusinessClient,
-            IOptions<WhatsAppBusinessCloudApiConfig> whatsAppConfig, IOptions<EmbeddedSignupConfiguration> embeddedSignupConfig, IWebHostEnvironment environment)
+            IOptions<WhatsAppBusinessCloudApiConfig> whatsAppConfig, IOptions<EmbeddedSignupConfiguration> embeddedSignupConfig, 
+            IWebHostEnvironment environment, ITwilioRestClient twilioClient, ITwilioIntegrationService twilioIntegrationService)
         {
             _logger = logger;
             _whatsAppBusinessClient = whatsAppBusinessClient;
             _whatsAppConfig = whatsAppConfig.Value;
             _embeddedSignupConfig = embeddedSignupConfig.Value;
             _environment = environment;
+            _twilioClient = twilioClient;
+            _twilioIntegrationService = twilioIntegrationService;
         }
 
         public IActionResult Index()
@@ -1612,6 +1625,30 @@ namespace WhatsAppBusinessCloudAPI.Web.Controllers
             return View(config);
         }
 
+
+
+
+
+
+
+        public IActionResult TwilioEmbeddedSignup()
+        {
+            // Create a copy of the configuration with runtime base URL
+            var config = new EmbeddedSignupConfiguration
+            {
+                AppId = _embeddedSignupConfig.AppId,
+                AppSecret = _embeddedSignupConfig.AppSecret,
+                ConfigurationId = _embeddedSignupConfig.ConfigurationId,
+                GraphApiVersion = _embeddedSignupConfig.GraphApiVersion,
+                // Use configured BaseUrl if provided, otherwise use runtime detection
+                BaseUrl = string.IsNullOrEmpty(_embeddedSignupConfig.BaseUrl) 
+                    ? $"{Request.Scheme}://{Request.Host}{Request.PathBase}" 
+                    : _embeddedSignupConfig.BaseUrl
+            };
+            
+            return View(config);
+        }
+
         [HttpPost]
         [ValidateAntiForgeryToken]
         public async Task<IActionResult> ExchangeToken([FromBody] ExchangeTokenRequestViewModel request)
@@ -1656,5 +1693,474 @@ namespace WhatsAppBusinessCloudAPI.Web.Controllers
                 return Json(new { success = false, error = ex.Message });
             }
         }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> GetSharedWABADetails([FromBody] GetSharedWABADetailsRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.AccessToken))
+                {
+                    return Json(new { success = false, error = "Access token is required" });
+                }
+
+                // Get the shared WABA ID using the access token
+                var sharedWabaResponse = await _whatsAppBusinessClient.GetSharedWABAIdAsync(request.AccessToken);
+                var wabaId = sharedWabaResponse.GetSharedWABAId();
+
+                if (string.IsNullOrEmpty(wabaId))
+                {
+                    return Json(new { success = false, error = "Could not retrieve WABA ID from access token" });
+                }
+
+                _logger.LogInformation("Retrieved WABA ID: {WabaId}", wabaId);
+
+                // Get detailed WABA information using the new endpoint
+                var wabaDetailsResponse = await _whatsAppBusinessClient.GetWABADetailsAsync(wabaId);
+                
+                // Try to get phone numbers for the WABA to get phone details and verified business name
+                // Note: This may return empty or null if no phone numbers are associated with the WABA yet
+                // (e.g., when only WABA sharing is selected and phone number selection is skipped)
+                PhoneNumberResponse? phoneNumberResponse = null;
+                string? phoneNumberId = null;
+                PhoneNumberData? phoneNumberData = null;
+                string? displayPhoneNumber = null;
+                
+                try
+                {
+                    phoneNumberResponse = await _whatsAppBusinessClient.GetWhatsAppBusinessAccountPhoneNumberAsync(wabaId);
+                    
+                    if (phoneNumberResponse?.Data != null && phoneNumberResponse.Data.Any())
+                    {
+                        // Get the most recently onboarded phone number details
+                        phoneNumberId = phoneNumberResponse.GetMostRecentlyOnboardedPhoneNumberId();
+                        phoneNumberData = phoneNumberResponse.Data?.FirstOrDefault(p => p.Id == phoneNumberId);
+                        displayPhoneNumber = phoneNumberData?.DisplayPhoneNumber;
+                        
+                        _logger.LogInformation("Retrieved phone number details for WABA {WabaId} - PhoneId: {PhoneId}, Display: {DisplayPhoneNumber}", 
+                            wabaId, phoneNumberId, displayPhoneNumber);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("No phone numbers found for WABA {WabaId} - this is expected when only WABA sharing is enabled", wabaId);
+                    }
+                }
+                catch (Exception phoneEx)
+                {
+                    _logger.LogWarning(phoneEx, "Could not retrieve phone numbers for WABA {WabaId} - this may be expected if no phone numbers are associated yet", wabaId);
+                    // Continue execution - phone numbers are optional for WABA-only sharing
+                }
+                
+                // Get business name from multiple sources with priority:
+                // 1. Phone number verified_name (most reliable, but may be null)
+                // 2. WABA owner business info name
+                // 3. WABA name
+                // 4. Fallback to "Unknown Business"
+                string businessName = phoneNumberData?.VerifiedName ?? 
+                                      wabaDetailsResponse.OwnerBusinessInfo?.Name ?? 
+                                      wabaDetailsResponse.Name ?? 
+                                      "Unknown Business";
+                
+                _logger.LogInformation("Retrieved enhanced business details - Name: {BusinessName}, Phone: {PhoneNumber}, PhoneId: {PhoneId}, Status: {Status}, HealthStatus: {HealthStatus}", 
+                    businessName, displayPhoneNumber ?? "None", phoneNumberId ?? "None", wabaDetailsResponse.Status, wabaDetailsResponse.HealthStatus?.CanSendMessage);
+
+                return Json(new { 
+                    success = true, 
+                    data = new {
+                        id = wabaId,
+                        name = businessName,
+                        phone_number_id = phoneNumberId, // May be null if no phone numbers available
+                        display_phone_number = displayPhoneNumber, // May be null if no phone numbers available
+                        verified_name = phoneNumberData?.VerifiedName, // May be null if no phone numbers available
+                        has_phone_numbers = phoneNumberResponse?.Data?.Any() == true, // Indicates if phone numbers are available
+                        
+                        // Enhanced WABA details
+                        currency = wabaDetailsResponse.Currency,
+                        timezone_id = wabaDetailsResponse.TimezoneId,
+                        account_review_status = wabaDetailsResponse.AccountReviewStatus,
+                        business_verification_status = wabaDetailsResponse.BusinessVerificationStatus,
+                        country = wabaDetailsResponse.Country,
+                        status = wabaDetailsResponse.Status,
+                        primary_business_location = wabaDetailsResponse.PrimaryBusinessLocation,
+                        
+                        // Owner business information
+                        owner_business_info = wabaDetailsResponse.OwnerBusinessInfo != null ? new {
+                            id = wabaDetailsResponse.OwnerBusinessInfo.Id,
+                            name = wabaDetailsResponse.OwnerBusinessInfo.Name
+                        } : null,
+                        
+                        // Health status
+                        health_status = wabaDetailsResponse.HealthStatus != null ? new {
+                            can_send_message = wabaDetailsResponse.HealthStatus.CanSendMessage,
+                            entities = wabaDetailsResponse.HealthStatus.Entities
+                        } : null,
+                        
+                        // Phone numbers list for additional context (may be null if no phone numbers available)
+                        phoneNumbers = phoneNumberResponse?.Data
+                    }
+                });
+            }
+            catch (WhatsappBusinessCloudAPIException ex)
+            {
+                _logger.LogError(ex, "WhatsApp API error during WABA details retrieval");
+                return Json(new { success = false, error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during WABA details retrieval");
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> CreateTwilioSubaccount([FromBody] CreateTwilioSubaccountRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.BusinessName) || string.IsNullOrEmpty(request.WabaId))
+                {
+                    return Json(new { success = false, error = "Business name and WABA ID are required" });
+                }
+
+                _logger.LogInformation("Creating Twilio subaccount for business: {BusinessName}, WABA: {WabaId}", 
+                    request.BusinessName, request.WabaId);
+
+                // Create Twilio subaccount using the service
+                var (subaccountSuccess, subaccountSid, subaccountAuthToken, mainAccountSid, mainAccountToken, subaccountError) = 
+                    await _twilioIntegrationService.CreateTwilioSubaccountAsync(request.BusinessName, request.WabaId);
+
+                _logger.LogInformation("Subaccount creation result: Success={Success}, SID={SID}, AuthTokenPresent={AuthTokenPresent}, MainAccountAuthPresent={MainAccountAuthPresent}, Error={Error}", 
+                    subaccountSuccess, subaccountSid, !string.IsNullOrEmpty(subaccountAuthToken), !string.IsNullOrEmpty(mainAccountToken), subaccountError);
+
+                if (subaccountSuccess && !string.IsNullOrEmpty(subaccountSid))
+                {
+                    _logger.LogInformation("Twilio subaccount created successfully for {BusinessName} - SID: {SubaccountSid}", 
+                        request.BusinessName, subaccountSid);
+
+                    // Determine which authentication method to return
+                    string authMethod = "none";
+                    if (!string.IsNullOrEmpty(subaccountAuthToken))
+                    {
+                        authMethod = "subaccount_auth_token";
+                    }
+                    else if (!string.IsNullOrEmpty(mainAccountToken))
+                    {
+                        authMethod = "main_account_credentials";
+                    }
+
+                    // Return subaccount details and pass-through data for subsequent phone number operations
+                    return Json(new { 
+                        success = true, 
+                        data = new {
+                            twilioSubaccountSid = subaccountSid,
+                            twilioAuthToken = subaccountAuthToken, // May be null - this is normal
+                            twilioMainAccountSid = mainAccountSid, // Main account SID for authentication
+                            twilioMainAccountToken = mainAccountToken, // Main account token for authentication
+                            authenticationMethod = authMethod, // Indicates which auth method to use
+                            businessName = request.BusinessName,
+                            wabaId = request.WabaId,
+                            // Pass-through data for phone number operations
+                            phoneNumberType = request.PhoneNumberType,
+                            wabaPhoneNumberId = request.PhoneNumberId,
+                            wabaPhoneNumberForDisplay = request.DisplayPhoneNumber,
+                            message = "Twilio subaccount created successfully. Use the provided credentials for phone number operations."
+                        }
+                    });
+                }
+                else
+                {
+                    _logger.LogError("Failed to create Twilio subaccount: {Error}", subaccountError);
+                    return Json(new { success = false, error = $"Failed to create Twilio subaccount: {subaccountError}" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during Twilio subaccount creation");
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> GetAvailableCountries([FromBody] GetAvailableCountriesRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SubaccountSid) || string.IsNullOrEmpty(request.SubaccountAuthToken))
+                {
+                    return Json(new { success = false, error = "Subaccount SID and auth token are required" });
+                }
+
+                _logger.LogInformation("Getting available countries for Twilio subaccount: {SubaccountSid}", request.SubaccountSid);
+
+                var countries = await _twilioIntegrationService.GetAvailableCountriesAsync(request.SubaccountSid, request.SubaccountAuthToken);
+                
+                _logger.LogInformation("Retrieved {Count} available countries", countries.Count);
+                
+                return Json(new { 
+                    success = true, 
+                    data = new {
+                        countries = countries,
+                        totalCount = countries.Count
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting available countries");
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> CheckRegulatoryRequirements([FromBody] CheckRegulatoryRequirementsRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SubaccountSid) || string.IsNullOrEmpty(request.SubaccountAuthToken) || 
+                    string.IsNullOrEmpty(request.IsoCountry) || string.IsNullOrEmpty(request.NumberType))
+                {
+                    return Json(new { success = false, error = "Subaccount SID, auth token, country code, and number type are required" });
+                }
+
+                _logger.LogInformation("Checking regulatory requirements for {IsoCountry} {NumberType}", 
+                    request.IsoCountry, request.NumberType);
+
+                var (requiresBundle, supportedCountry, message) = await _twilioIntegrationService.CheckRegulatoryRequirementsAsync(
+                    request.SubaccountSid, request.SubaccountAuthToken, request.IsoCountry, request.NumberType);
+
+                return Json(new { 
+                    success = true, 
+                    requiresBundle = requiresBundle,
+                    supportedCountry = supportedCountry,
+                    isoCountry = request.IsoCountry?.ToUpper(),
+                    numberType = request.NumberType?.ToLower(),
+                    message = message
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error checking regulatory requirements for {IsoCountry} {NumberType}", 
+                    request.IsoCountry, request.NumberType);
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> CreateRegulatoryBundle([FromBody] CreateRegulatoryBundleRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SubaccountSid) || string.IsNullOrEmpty(request.SubaccountAuthToken) ||
+                    string.IsNullOrEmpty(request.BusinessName) || string.IsNullOrEmpty(request.IsoCountry))
+                {
+                    return Json(new { success = false, error = "Subaccount SID, auth token, business name, and ISO country are required" });
+                }
+
+                // Validate required fields based on country
+                if (request.IsoCountry?.ToUpper() == "GB")
+                {
+                    if (string.IsNullOrEmpty(request.BusinessRegistrationNumber) ||
+                        string.IsNullOrEmpty(request.BusinessAddress) ||
+                        string.IsNullOrEmpty(request.BusinessCity) ||
+                        string.IsNullOrEmpty(request.BusinessPostalCode) ||
+                        string.IsNullOrEmpty(request.AuthorizedContactFirstName) ||
+                        string.IsNullOrEmpty(request.AuthorizedContactLastName) ||
+                        string.IsNullOrEmpty(request.AuthorizedContactEmail) ||
+                        string.IsNullOrEmpty(request.AuthorizedContactPhone))
+                    {
+                        return Json(new { success = false, error = "All business information fields are required for GB regulatory bundles" });
+                    }
+                }
+
+                _logger.LogInformation("Creating regulatory bundle for {BusinessName} in {IsoCountry}", 
+                    request.BusinessName, request.IsoCountry);
+
+                var (bundleSuccess, bundleSid, bundleError) = await _twilioIntegrationService.CreateRegulatoryBundleAsync(request);
+
+                if (bundleSuccess && !string.IsNullOrEmpty(bundleSid))
+                {
+                    _logger.LogInformation("Regulatory bundle created successfully: {BundleSid}", bundleSid);
+
+                    return Json(new { 
+                        success = true, 
+                        bundleSid = bundleSid,
+                        message = "Regulatory bundle created successfully and is pending approval.",
+                        data = new {
+                            bundleSid = bundleSid,
+                            isoCountry = request.IsoCountry?.ToUpper(),
+                            numberType = request.NumberType?.ToLower(),
+                            businessName = request.BusinessName,
+                            endUserType = request.EndUserType
+                        }
+                    });
+                }
+                else
+                {
+                    _logger.LogError("Failed to create regulatory bundle: {Error}", bundleError);
+                    return Json(new { success = false, error = bundleError ?? "Failed to create regulatory bundle" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error creating regulatory bundle for {BusinessName} in {IsoCountry}", 
+                    request.BusinessName, request.IsoCountry);
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> GetAvailablePhoneNumbers([FromBody] GetAvailablePhoneNumbersRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SubaccountSid) || string.IsNullOrEmpty(request.SubaccountAuthToken) || 
+                    string.IsNullOrEmpty(request.CountryCode) || string.IsNullOrEmpty(request.PhoneNumberType))
+                {
+                    return Json(new { success = false, error = "Subaccount SID, auth token, country code, and phone number type are required" });
+                }
+
+                _logger.LogInformation("Getting available {PhoneNumberType} phone numbers for country: {CountryCode}, SubaccountSid: {SubaccountSid}", 
+                    request.PhoneNumberType, request.CountryCode, request.SubaccountSid);
+
+                var phoneNumbers = await _twilioIntegrationService.GetAvailablePhoneNumbersAsync(
+                    request.SubaccountSid, 
+                    request.SubaccountAuthToken, 
+                    request.CountryCode, 
+                    request.PhoneNumberType,
+                    request.Limit ?? 20);
+                
+                _logger.LogInformation("Retrieved {Count} available {PhoneNumberType} phone numbers for {CountryCode}", 
+                    phoneNumbers.Count, request.PhoneNumberType, request.CountryCode);
+                
+                return Json(new { 
+                    success = true, 
+                    data = new {
+                        phoneNumbers = phoneNumbers,
+                        countryCode = request.CountryCode,
+                        phoneNumberType = request.PhoneNumberType,
+                        totalCount = phoneNumbers.Count
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting available phone numbers for {CountryCode} {PhoneNumberType}", 
+                    request.CountryCode, request.PhoneNumberType);
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> PurchasePhoneNumber([FromBody] PurchasePhoneNumberRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SubaccountSid) || string.IsNullOrEmpty(request.SubaccountAuthToken) || 
+                    string.IsNullOrEmpty(request.PhoneNumber) || string.IsNullOrEmpty(request.BusinessName))
+                {
+                    return Json(new { success = false, error = "Subaccount SID, auth token, phone number, and business name are required" });
+                }
+
+                _logger.LogInformation("Purchasing Twilio phone number {PhoneNumber} for business: {BusinessName}, SubaccountSid: {SubaccountSid}", 
+                    request.PhoneNumber, request.BusinessName, request.SubaccountSid);
+
+                var purchaseResult = await _twilioIntegrationService.PurchasePhoneNumberAsync(
+                    request.SubaccountSid,
+                    request.PhoneNumber,
+                    request.BusinessName,
+                    request.CountryCode ?? "");
+
+                if (purchaseResult.Success)
+                {
+                    _logger.LogInformation("Twilio phone number {PhoneNumber} purchased successfully for {BusinessName}", 
+                        request.PhoneNumber, request.BusinessName);
+
+                    return Json(new { 
+                        success = true, 
+                        data = new {
+                            phoneNumber = request.PhoneNumber,
+                            phoneNumberSid = purchaseResult.PhoneNumberSid,
+                            subaccountSid = request.SubaccountSid,
+                            businessName = request.BusinessName,
+                            message = $"Twilio phone number {request.PhoneNumber} purchased successfully"
+                        }
+                    });
+                }
+                else
+                {
+                    _logger.LogError("Failed to purchase Twilio phone number {PhoneNumber}: {Error}", request.PhoneNumber, purchaseResult.ErrorMessage);
+                    return Json(new { success = false, error = $"Failed to purchase Twilio phone number: {purchaseResult.ErrorMessage}" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error purchasing Twilio phone number {PhoneNumber}", request.PhoneNumber);
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> RegisterPhoneNumberForWhatsApp([FromBody] RegisterPhoneNumberForWhatsAppRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SubaccountSid) || string.IsNullOrEmpty(request.SubaccountAuthToken) || 
+                    string.IsNullOrEmpty(request.PhoneNumber) || string.IsNullOrEmpty(request.BusinessName) ||
+                    string.IsNullOrEmpty(request.WabaId))
+                {
+                    return Json(new { success = false, error = "Subaccount SID, auth token, phone number, business name, and WABA ID are required" });
+                }
+
+                _logger.LogInformation("Registering phone number {PhoneNumber} for WhatsApp - Business: {BusinessName}, WABA: {WabaId}, SubaccountSid: {SubaccountSid}", 
+                    request.PhoneNumber, request.BusinessName, request.WabaId, request.SubaccountSid);
+
+                var webhookBaseUrl = $"{Request.Scheme}://{Request.Host}/api/WhatsAppNotification";
+                var registrationResult = await _twilioIntegrationService.RegisterPhoneNumberForWhatsAppAsync(
+                    request.SubaccountSid, 
+                    request.SubaccountAuthToken, 
+                    request.PhoneNumber, 
+                    request.BusinessName,
+                    request.WabaId,
+                    webhookBaseUrl);
+
+                if (registrationResult.Success)
+                {
+                    _logger.LogInformation("Phone number {PhoneNumber} registered for WhatsApp successfully - SenderSid: {SenderSid}", 
+                        request.PhoneNumber, registrationResult.SenderSid);
+
+                    return Json(new { 
+                        success = true, 
+                        data = new {
+                            phoneNumber = request.PhoneNumber,
+                            senderSid = registrationResult.SenderSid,
+                            subaccountSid = request.SubaccountSid,
+                            businessName = request.BusinessName,
+                            wabaId = request.WabaId,
+                            status = registrationResult.Status,
+                            message = $"Phone number {request.PhoneNumber} registered for WhatsApp successfully"
+                        }
+                    });
+                }
+                else
+                {
+                    _logger.LogError("Failed to register phone number {PhoneNumber} for WhatsApp: {Error}", request.PhoneNumber, registrationResult.ErrorMessage);
+                    return Json(new { success = false, error = $"Failed to register phone number for WhatsApp: {registrationResult.ErrorMessage}" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error registering phone number {PhoneNumber} for WhatsApp", request.PhoneNumber);
+                return Json(new { success = false, error = ex.Message });
+            }
+        }
+
     }
 }
